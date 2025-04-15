@@ -1,0 +1,49 @@
+name: Go CI Pipeline
+
+# Запускати workflow при push у гілки main або master,
+# а також при створенні/оновленні Pull Request до цих гілок
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    # Використовуємо останню версію Ubuntu (стабільна для CI)
+    runs-on: ubuntu-latest
+    steps:
+      # Крок 1: Отримання коду репозиторію з поточної гілки
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Крок 2: Налаштування середовища Go
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21' # Вкажіть вашу версію Go, якщо вона інша (напр. '1.24')
+
+      # Крок 3: Встановлення системних залежностей для Shiny/графіки на Ubuntu
+      # Це потрібно, щоб компіляція тестів або збірка пройшли успішно
+      - name: Install system dependencies for Shiny
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev libxxf86vm-dev xorg-dev libglu1-mesa-dev
+
+      # Крок 4: Завантаження залежностей Go (з go.mod/go.sum)
+      - name: Download Go dependencies
+        run: go mod download
+
+      # Крок 5: Запуск статичного аналізу (перевірка коду на потенційні проблеми)
+      - name: Run go vet
+        run: go vet ./...
+
+      # Крок 6: Запуск тестів
+      # xvfb створює віртуальний екран, може бути потрібним для тестів, що використовують shiny
+      - name: Run tests
+        run: xvfb-run --auto-servernum go test -v ./...
+        # Примітка: Якщо ви не використовували -race локально,
+        # тут він теж не доданий, щоб уникнути проблем з CGO в CI.
+
+      # Крок 7: Збірка основного додатку (для Linux, бо CI на Ubuntu)
+      - name: Build application
+        run: go build -v -o painter-app-linux ./cmd/painter
