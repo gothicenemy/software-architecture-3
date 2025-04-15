@@ -1,14 +1,12 @@
 package ui
 
 import (
+	"github.com/gothicenemy/software-architecture-3/painter"
 	"image"
-	"image/color"
+	"image/draw"
 	"log"
 
-	"golang.org/x/exp/shiny/driver"
-	"golang.org/x/exp/shiny/imageutil"
 	"golang.org/x/exp/shiny/screen"
-	"golang.org/x/image/draw"
 	"golang.org/x/mobile/event/key"
 	"golang.org/x/mobile/event/lifecycle"
 	"golang.org/x/mobile/event/mouse"
@@ -16,127 +14,199 @@ import (
 	"golang.org/x/mobile/event/size"
 )
 
-type Visualizer struct {
-	Title         string
-	Debug         bool
-	OnScreenReady func(s screen.Screen)
-
-	w    screen.Window
-	tx   chan screen.Texture
-	done chan struct{}
-
-	sz  size.Event
-	pos image.Rectangle
+type Window struct {
+	Title            string
+	Debug            bool
+	window           screen.Window
+	events           chan interface{}
+	tx               chan screen.Texture
+	closeReq         chan struct{}
+	closed           chan struct{}
+	windowSize       size.Event
+	figureX, figureY int
+	painterLoop      *painter.Loop
 }
 
-func (pw *Visualizer) Main() {
-	pw.tx = make(chan screen.Texture)
-	pw.done = make(chan struct{})
-	pw.pos.Max.X = 200
-	pw.pos.Max.Y = 200
-	driver.Main(pw.run)
-}
+const (
+	WindowWidth  = 800
+	WindowHeight = 800
+)
 
-func (pw *Visualizer) Update(t screen.Texture) {
-	pw.tx <- t
-}
-
-func (pw *Visualizer) run(s screen.Screen) {
-	w, err := s.NewWindow(&screen.NewWindowOptions{
-		Title: pw.Title,
+func NewWindow(s screen.Screen, p *painter.Loop) *Window {
+	log.Println("Creating UI Window...")
+	win, err := s.NewWindow(&screen.NewWindowOptions{
+		Title:  "Painter Final",
+		Width:  WindowWidth,
+		Height: WindowHeight,
 	})
 	if err != nil {
-		log.Fatal("Failed to initialize the app window:", err)
+		log.Fatalf("!!! CRITICAL: Failed to create shiny window in ui.NewWindow: %v", err)
+		return nil
 	}
-	defer func() {
-		w.Release()
-		close(pw.done)
-	}()
+	log.Println("UI Shiny window created.")
 
-	if pw.OnScreenReady != nil {
-		pw.OnScreenReady(s)
+	w := &Window{
+		Title:       "Painter Final",
+		Debug:       true,
+		window:      win,
+		events:      make(chan interface{}),
+		tx:          make(chan screen.Texture),
+		closeReq:    make(chan struct{}),
+		closed:      make(chan struct{}),
+		figureX:     WindowWidth / 2,
+		figureY:     WindowHeight / 2,
+		windowSize:  size.Event{WidthPx: WindowWidth, HeightPx: WindowHeight},
+		painterLoop: p,
 	}
 
-	pw.w = w
+	if w.painterLoop != nil {
+		w.painterLoop.SetReceiver(w)
+	} else {
+		log.Println("Warning: ui.NewWindow received nil painterLoop")
+	}
 
-	events := make(chan any)
-	go func() {
-		for {
-			e := w.NextEvent()
-			if pw.Debug {
-				log.Printf("new event: %v", e)
-			}
-			if detectTerminate(e) {
-				close(events)
-				break
-			}
-			events <- e
+	go w.eventReader()
+
+	return w
+}
+
+func (w *Window) eventReader() {
+	defer close(w.closed)
+	for {
+		e := w.window.NextEvent()
+		if w.events == nil {
+			log.Println("Event channel is nil, stopping reader.")
+			return
 		}
-	}()
+		select {
+		case w.events <- e:
+		default:
+			if _, ok := e.(paint.Event); !ok {
+				log.Printf("Event queue full or closed, dropping event: %T", e)
+			}
+		}
+		if lcEvent, ok := e.(lifecycle.Event); ok && lcEvent.To == lifecycle.StageDead {
+			log.Println("Lifecycle dead in eventReader, stopping.")
+			return
+		}
+		select {
+		case <-w.closeReq:
+			log.Println("Close request received in eventReader, stopping.")
+			return
+		default:
+		}
+	}
+}
 
-	var t screen.Texture
+func (w *Window) Loop() {
+	if w.window == nil {
+		log.Println("Error: Window loop started with nil window.")
+		close(w.closed)
+		return
+	}
+	log.Println("Window event loop started.")
+
+	if w.painterLoop != nil {
+		w.painterLoop.Post(painter.UpdateOperation{})
+	}
 
 	for {
 		select {
-		case e, ok := <-events:
+		case e, ok := <-w.events:
 			if !ok {
+				log.Println("Event channel closed, exiting Window loop.")
 				return
 			}
-			pw.handleEvent(e, t)
-
-		case t = <-pw.tx:
-			w.Send(paint.Event{})
+			if w.handleEvent(e) {
+				return
+			}
+		case t, ok := <-w.tx:
+			if !ok {
+				log.Println("Texture channel closed.")
+				continue
+			}
+			if w.window != nil {
+				windowBounds := image.Rect(0, 0, w.windowSize.WidthPx, w.windowSize.HeightPx)
+				w.window.Scale(windowBounds, t, t.Bounds(), draw.Src, nil)
+				w.window.Publish()
+			} else {
+				t.Release()
+			}
+		case <-w.closeReq:
+			log.Println("Close requested, exiting Window loop.")
+			return
 		}
 	}
 }
 
-func detectTerminate(e any) bool {
-	switch e := e.(type) {
+func (w *Window) handleEvent(e interface{}) bool {
+	if w.Debug {
+		log.Printf("event: %T", e)
+	}
+	switch ev := e.(type) {
 	case lifecycle.Event:
-		if e.To == lifecycle.StageDead {
-			return true // Window destroy initiated.
+		if ev.To == lifecycle.StageDead {
+			log.Println("Lifecycle dead received in handleEvent")
+			return true
 		}
 	case key.Event:
-		if e.Code == key.CodeEscape {
-			return true // Esc pressed.
+		if ev.Code == key.CodeEscape {
+			log.Println("Escape pressed received in handleEvent")
+			return true
 		}
+	case mouse.Event:
+		if ev.Button == mouse.ButtonLeft && ev.Direction == mouse.DirPress {
+			w.figureX = int(ev.X)
+			w.figureY = int(ev.Y)
+			if w.painterLoop != nil && w.windowSize.WidthPx > 0 && w.windowSize.HeightPx > 0 {
+				relX := float64(ev.X) / float64(w.windowSize.WidthPx)
+				relY := float64(ev.Y) / float64(w.windowSize.HeightPx)
+				if relX < 0 {
+					relX = 0
+				}
+				if relX > 1 {
+					relX = 1
+				}
+				if relY < 0 {
+					relY = 0
+				}
+				if relY > 1 {
+					relY = 1
+				}
+				cmd := painter.MoveOperation{X: relX, Y: relY}
+				w.painterLoop.Post(cmd)
+				w.painterLoop.Post(painter.UpdateOperation{})
+				log.Printf("Sent 'move %.2f %.2f' and 'update' on click", relX, relY)
+			}
+		}
+	case size.Event:
+		w.windowSize = ev
+		log.Printf("Resized to: %dx%d", ev.WidthPx, ev.HeightPx)
+	case paint.Event:
+		if w.Debug {
+			log.Println("Paint event")
+		}
+	case error:
+		log.Printf("System error event: %v", e)
 	}
 	return false
 }
 
-func (pw *Visualizer) handleEvent(e any, t screen.Texture) {
-	switch e := e.(type) {
-
-	case size.Event: // Оновлення даних про розмір вікна.
-		pw.sz = e
-
-	case error:
-		log.Printf("ERROR: %s", e)
-
-	case mouse.Event:
-		if t == nil {
-			// TODO: Реалізувати реакцію на натискання кнопки миші.
-		}
-
-	case paint.Event:
-		// Малювання контенту вікна.
-		if t == nil {
-			pw.drawDefaultUI()
-		} else {
-			// Використання текстури отриманої через виклик Update.
-			pw.w.Scale(pw.sz.Bounds(), t, t.Bounds(), draw.Src, nil)
-		}
-		pw.w.Publish()
+func (w *Window) Update(t screen.Texture) {
+	select {
+	case w.tx <- t:
+	default:
+		log.Println("Warning: UI loop busy, skipping texture frame.")
 	}
 }
 
-func (pw *Visualizer) drawDefaultUI() {
-	pw.w.Fill(pw.sz.Bounds(), color.Black, draw.Src) // Фон.
-
-	// TODO: Змінити колір фону та додати відображення фігури у вашому варіанті.
-
-	// Малювання білої рамки.
-	for _, br := range imageutil.Border(pw.sz.Bounds(), 10) {
-		pw.w.Fill(br, color.White, draw.Src)
+func (w *Window) Stop() {
+	log.Println("Stop requested for Window")
+	select {
+	case w.closeReq <- struct{}{}:
+	default:
+		log.Println("Close request already pending.")
 	}
 }
+
+func (w *Window) Closed() <-chan struct{} { return w.closed }
